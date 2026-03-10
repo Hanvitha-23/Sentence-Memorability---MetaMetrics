@@ -1,0 +1,425 @@
+---
+title: "Sentence Memorability: Inferential Statistics"
+output:
+  pdf_document: default
+  html_document: default
+---
+
+```{r setup, message=FALSE, warning=FALSE}
+library(readr)
+library(dplyr)
+library(purrr)
+library(stringr)
+library(tidyr)
+library(ggplot2)
+library(tibble)
+
+# --------------------------------------------------
+# File path
+# --------------------------------------------------
+# Edit this path if your ZIP file is in a different location.
+zip_path <- "/Users/hanvitha/Downloads/Sentence Memorability.zip"
+
+if (!file.exists(zip_path)) {
+  stop("Could not find 'Sentence Memorability.zip'. Update zip_path to the correct file location.")
+}
+
+# --------------------------------------------------
+# Unzip logs
+# --------------------------------------------------
+unzip_dir <- file.path(tempdir(), "sentence_memorability_logs")
+if (dir.exists(unzip_dir)) unlink(unzip_dir, recursive = TRUE)
+dir.create(unzip_dir, recursive = TRUE)
+unzip(zip_path, exdir = unzip_dir)
+
+log_dir <- file.path(unzip_dir, "NewLogsAnonymized")
+if (!dir.exists(log_dir)) {
+  stop("Folder 'NewLogsAnonymized' was not found inside the ZIP.")
+}
+
+log_files <- list.files(log_dir, pattern = "\\.log$", full.names = TRUE)
+if (length(log_files) == 0) {
+  stop("No .log files were found inside 'NewLogsAnonymized'.")
+}
+
+# --------------------------------------------------
+# Read logs
+# --------------------------------------------------
+read_one_log <- function(path) {
+  suppressMessages(
+    readr::read_csv(path, show_col_types = FALSE, na = c("N/A", "", "NA"))
+  ) %>%
+    mutate(file = basename(path))
+}
+
+raw_logs <- purrr::map_dfr(log_files, read_one_log)
+
+# Keep only experimental events
+exp_logs <- raw_logs %>%
+  filter(!str_detect(Event, "^Practice"))
+
+# Quick sanity check
+required_cols <- c(
+  "participant_ID", "Timestamp", "Event", "Stimulus",
+  "isRepeat", "isTarget", "Reaction_time_IR",
+  "Reaction_time_WR", "Accuracy WR"
+)
+
+missing_cols <- setdiff(required_cols, names(exp_logs))
+if (length(missing_cols) > 0) {
+  stop(paste("Missing expected columns:", paste(missing_cols, collapse = ", ")))
+}
+```
+
+```{r parsing-functions}
+parse_trials_safe <- function(df) {
+  df <- df %>% arrange(Timestamp)
+
+  started <- FALSE
+  block <- 0L
+  out <- list()
+  current <- NULL
+  seen <- list()
+
+  finalize_current <- function(cur, out_list) {
+    if (!is.null(cur)) out_list[[length(out_list) + 1]] <- cur
+    out_list
+  }
+
+  for (i in seq_len(nrow(df))) {
+    row <- df[i, , drop = FALSE]
+    event <- as.character(row$Event[[1]])
+
+    if (identical(event, "Sentence shown")) {
+      if (!started) {
+        started <- TRUE
+        block <- 1L
+      }
+
+      out <- finalize_current(current, out)
+
+      stim <- as.character(row$Stimulus[[1]])
+      m <- stringr::str_match(stim, "^([A-Z]+)_([0-9]+)_([AP])$")
+
+      if (all(is.na(m))) next
+
+      cond  <- m[, 2]
+      sid   <- as.integer(m[, 3])
+      voice <- m[, 4]
+      base  <- paste(cond, sid, sep = "_")
+
+      repeat_raw <- row$isRepeat[[1]]
+      repeat_flag <- FALSE
+      if (!is.null(repeat_raw) && !is.na(repeat_raw)) {
+        repeat_flag <- tolower(trimws(as.character(repeat_raw))) == "true"
+      }
+
+      target_raw <- row$isTarget[[1]]
+      target_flag <- FALSE
+      if (!is.null(target_raw) && !is.na(target_raw)) {
+        target_flag <- tolower(trimws(as.character(target_raw))) == "true"
+      }
+
+      prev_voices <- seen[[base]]
+
+      rep_type <- "new"
+      if (isTRUE(repeat_flag)) {
+        if (!is.null(prev_voices) && voice %in% prev_voices) {
+          rep_type <- "exact"
+        } else if (!is.null(prev_voices) && length(prev_voices) > 0) {
+          rep_type <- "similar"
+        } else {
+          rep_type <- "repeat_no_prev"
+        }
+      }
+
+      seen[[base]] <- c(prev_voices, voice)
+
+      current <- tibble::tibble(
+        participant_ID = as.character(row$participant_ID[[1]]),
+        block = as.integer(block),
+        stimulus = stim,
+        cond = cond,
+        sid = sid,
+        voice = voice,
+        isTarget = target_flag,
+        isRepeat = repeat_flag,
+        rep_type = rep_type,
+        ir_pressed = FALSE,
+        ir_rt = NA_real_,
+        wr_pressed = FALSE,
+        wr_rt = NA_real_,
+        wr_accuracy = NA_real_
+      )
+
+    } else if (identical(event, "Rest Phase started")) {
+      out <- finalize_current(current, out)
+      current <- NULL
+      if (started) {
+        block <- block + 1L
+        seen <- list()
+      }
+
+    } else {
+      if (is.null(current)) next
+
+      if (stringr::str_detect(event, "IR pressed")) {
+        current$ir_pressed <- TRUE
+        current$ir_rt <- suppressWarnings(as.numeric(row$Reaction_time_IR[[1]]))
+      }
+
+      if (identical(event, "WR pressed")) {
+        current$wr_pressed <- TRUE
+        current$wr_rt <- suppressWarnings(as.numeric(row$Reaction_time_WR[[1]]))
+        current$wr_accuracy <- suppressWarnings(as.numeric(row$`Accuracy WR`[[1]]))
+      }
+    }
+  }
+
+  out <- finalize_current(current, out)
+
+  if (length(out) == 0) return(tibble::tibble())
+  dplyr::bind_rows(out)
+}
+
+assign_blocks_for_validation <- function(df) {
+  df <- df %>% arrange(Timestamp)
+
+  started <- FALSE
+  block <- 0L
+  block_id <- rep(NA_integer_, nrow(df))
+
+  for (i in seq_len(nrow(df))) {
+    if (!started && df$Event[i] == "Sentence shown") {
+      started <- TRUE
+      block <- 1L
+    }
+
+    if (started) block_id[i] <- block
+
+    if (started && df$Event[i] == "Rest Phase started") {
+      block <- block + 1L
+    }
+  }
+
+  df$block <- block_id
+  df
+}
+```
+
+```{r build-trial-data}
+split_logs <- split(exp_logs, exp_logs$participant_ID)
+
+trial_list <- lapply(split_logs, function(df_part) {
+  df_part <- df_part[order(df_part$Timestamp), ]
+  parse_trials_safe(df_part)
+})
+
+trial_data <- bind_rows(trial_list) %>%
+  mutate(
+    participant_ID = as.character(participant_ID),
+    block = as.integer(block)
+  )
+
+validation_df <- bind_rows(lapply(split_logs, function(df_part) {
+  df_part <- df_part[order(df_part$Timestamp), ]
+  assign_blocks_for_validation(df_part)
+})) %>%
+  mutate(
+    participant_ID = as.character(participant_ID),
+    block = as.integer(block)
+  ) %>%
+  filter(!is.na(block)) %>%
+  group_by(participant_ID, block) %>%
+  summarise(
+    correct = sum(Event == "Validation IR pressed", na.rm = TRUE),
+    wrong   = sum(Event == "Validation Wrong IR pressed", na.rm = TRUE),
+    missed  = sum(Event == "Validation Missed", na.rm = TRUE),
+    pass    = correct > (wrong / 2 + missed),
+    .groups = "drop"
+  )
+
+valid_trials <- trial_data %>%
+  inner_join(
+    validation_df %>% filter(pass) %>% select(participant_ID, block),
+    by = c("participant_ID", "block")
+  ) %>%
+  mutate(
+    stype = case_when(
+      cond == "HH"  ~ "HH",
+      cond == "HVL" ~ "HL",
+      cond == "LVH" ~ "LH",
+      cond == "LVL" ~ "LL",
+      TRUE ~ cond
+    )
+  )
+
+cat("Total parsed trials:", nrow(trial_data), "\n")
+cat("Total valid trials:", nrow(valid_trials), "\n")
+cat("Participants in valid trials:", dplyr::n_distinct(valid_trials$participant_ID), "\n")
+```
+
+```{r participant-level-summaries}
+baseline_df <- valid_trials %>%
+  filter(stype == "HF") %>%
+  group_by(participant_ID) %>%
+  summarise(
+    baseline_old_rate = mean(ir_pressed, na.rm = TRUE),
+    .groups = "drop"
+  )
+
+hit_df <- valid_trials %>%
+  filter(stype %in% c("HH", "HL", "LH", "LL"), isTarget, isRepeat) %>%
+  group_by(participant_ID, stype, voice) %>%
+  summarise(
+    hit_rate = mean(ir_pressed, na.rm = TRUE),
+    .groups = "drop"
+  )
+
+score_df <- hit_df %>%
+  left_join(baseline_df, by = "participant_ID") %>%
+  mutate(corrected_score = hit_rate - baseline_old_rate)
+
+wr_df <- valid_trials %>%
+  filter(stype %in% c("HH", "HL", "LH", "LL"), isTarget, isRepeat, ir_pressed, wr_pressed) %>%
+  group_by(participant_ID, stype, voice, rep_type) %>%
+  summarise(
+    wr_acc = mean(wr_accuracy, na.rm = TRUE),
+    .groups = "drop"
+  )
+```
+
+## Q1: repeated-measures ANOVA across sentence type
+
+```{r q1-anova}
+q1_df <- score_df %>%
+  group_by(participant_ID, stype) %>%
+  summarise(score = mean(corrected_score, na.rm = TRUE), .groups = "drop") %>%
+  mutate(
+    participant_ID = factor(participant_ID),
+    stype = factor(stype, levels = c("HH", "HL", "LH", "LL"))
+  )
+
+q1_aov <- aov(score ~ stype + Error(participant_ID/stype), data = q1_df)
+summary(q1_aov)
+```
+
+## Q1 post-hoc paired t-tests with Holm correction
+
+```{r q1-posthoc}
+q1_wide <- q1_df %>%
+  pivot_wider(names_from = stype, values_from = score) %>%
+  filter(complete.cases(HH, HL, LH, LL))
+
+pair_list <- list(
+  c("HH", "HL"),
+  c("HH", "LH"),
+  c("HH", "LL"),
+  c("HL", "LH"),
+  c("HL", "LL"),
+  c("LH", "LL")
+)
+
+posthoc_results <- lapply(pair_list, function(p) {
+  tmp <- q1_wide %>%
+    select(participant_ID, all_of(p)) %>%
+    filter(complete.cases(.))
+
+  tt <- t.test(tmp[[p[1]]], tmp[[p[2]]], paired = TRUE)
+
+  tibble(
+    comparison = paste(p[1], "vs", p[2]),
+    mean_diff = mean(tmp[[p[1]]] - tmp[[p[2]]], na.rm = TRUE),
+    t = as.numeric(tt$statistic),
+    df = as.numeric(tt$parameter),
+    p_raw = tt$p.value
+  )
+}) %>%
+  bind_rows() %>%
+  mutate(p_holm = p.adjust(p_raw, method = "holm"))
+
+posthoc_results
+```
+
+## Q2: active vs passive corrected memorability
+
+```{r q2-voice}
+q2_df <- score_df %>%
+  group_by(participant_ID, voice) %>%
+  summarise(score = mean(corrected_score, na.rm = TRUE), .groups = "drop") %>%
+  mutate(voice = factor(voice, levels = c("A", "P"), labels = c("Active", "Passive"))) %>%
+  pivot_wider(names_from = voice, values_from = score) %>%
+  filter(complete.cases(Active, Passive))
+
+q2_test <- t.test(q2_df$Active, q2_df$Passive, paired = TRUE)
+q2_test
+colMeans(q2_df[, c("Active", "Passive")], na.rm = TRUE)
+```
+
+## Q3: subject effect vs object effect
+
+```{r q3-subject-object}
+q3_wide <- q1_df %>%
+  pivot_wider(names_from = stype, values_from = score) %>%
+  filter(complete.cases(HH, HL, LH, LL)) %>%
+  mutate(
+    subject_effect = ((HH + HL) / 2) - ((LH + LL) / 2),
+    object_effect  = ((HH + LH) / 2) - ((HL + LL) / 2)
+  )
+
+q3_test <- t.test(q3_wide$subject_effect, q3_wide$object_effect, paired = TRUE)
+q3_test
+colMeans(q3_wide[, c("subject_effect", "object_effect")], na.rm = TRUE)
+```
+
+## Q4: wording-recognition accuracy (exact vs voice-transformed)
+
+```{r q4-wording}
+q4_df <- wr_df %>%
+  filter(rep_type %in% c("exact", "similar")) %>%
+  group_by(participant_ID, rep_type) %>%
+  summarise(wr_acc = mean(wr_acc, na.rm = TRUE), .groups = "drop") %>%
+  pivot_wider(names_from = rep_type, values_from = wr_acc) %>%
+  filter(complete.cases(exact, similar))
+
+q4_test <- t.test(q4_df$exact, q4_df$similar, paired = TRUE)
+q4_test
+colMeans(q4_df[, c("exact", "similar")], na.rm = TRUE)
+```
+
+## Compact summary table
+
+```{r summary-table}
+summary_table <- tibble(
+  Question = c(
+    "Q2: Active vs Passive",
+    "Q3: Subject effect vs Object effect",
+    "Q4: Exact vs Voice-transformed WR"
+  ),
+  Statistic = c(
+    paste0("t(", round(q2_test$parameter, 0), ") = ", round(q2_test$statistic, 2)),
+    paste0("t(", round(q3_test$parameter, 0), ") = ", round(q3_test$statistic, 2)),
+    paste0("t(", round(q4_test$parameter, 0), ") = ", round(q4_test$statistic, 2))
+  ),
+  p_value = c(
+    q2_test$p.value,
+    q3_test$p.value,
+    q4_test$p.value
+  )
+)
+
+summary_table
+```
+
+## Optional: formatted values to copy into report
+
+```{r report-values}
+cat("Q2 mean Active:", round(mean(q2_df$Active, na.rm = TRUE), 3), "\n")
+cat("Q2 mean Passive:", round(mean(q2_df$Passive, na.rm = TRUE), 3), "\n\n")
+
+cat("Q3 mean Subject effect:", round(mean(q3_wide$subject_effect, na.rm = TRUE), 3), "\n")
+cat("Q3 mean Object effect:", round(mean(q3_wide$object_effect, na.rm = TRUE), 3), "\n\n")
+
+cat("Q4 mean Exact:", round(mean(q4_df$exact, na.rm = TRUE), 3), "\n")
+cat("Q4 mean Similar:", round(mean(q4_df$similar, na.rm = TRUE), 3), "\n")
+```
